@@ -37,6 +37,7 @@ allow-direct-references = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["src"]
 addopts = "--cov=src/cerebra --cov-report=term-missing --cov-report=html"
 filterwarnings = [
     "ignore::DeprecationWarning",
