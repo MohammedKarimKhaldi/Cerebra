@@ -54,6 +54,26 @@ At inference the best available model is used automatically:
 
 ---
 
+## Quickstart — one command
+
+After cloning, a single command updates the repo, installs/updates dependencies, cleans caches + temp files, and launches the web UI:
+
+```bash
+./run.sh
+```
+
+Then open **http://localhost:8000**. The trained checkpoint ships in the repo, so it works out of the box. Useful overrides:
+
+```bash
+PORT=9000 ./run.sh          # different port
+CEREBRA_CPU=1 ./run.sh      # install CPU-only PyTorch (no GPU host)
+CEREBRA_NO_SERVE=1 ./run.sh # update + clean only, don't start the server
+```
+
+The rest of this README documents the individual pieces (`run.sh` just chains them).
+
+---
+
 ## Real data + training
 
 ### 1. Download the public dataset (~7.6 GB, no registration)

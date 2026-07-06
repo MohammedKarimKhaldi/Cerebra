@@ -64,3 +64,6 @@ Thumbs.db
 
 # Logs
 *.log
+
+# uv lockfile — env-specific (CPU vs CUDA torch); install uses pyproject, not the lock
+uv.lock
