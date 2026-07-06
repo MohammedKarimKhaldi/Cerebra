@@ -131,7 +131,7 @@ def train(cfg: TrainConfig, checkpoint_path: Path = DEFAULT_CHECKPOINT) -> Train
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.max_epochs)
     use_amp = device.type == "cuda"
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     dice_metric = DiceMetric(include_background=True, reduction="mean")
     post_pred = Compose([Activations(sigmoid=True), AsDiscrete(threshold=0.5)])

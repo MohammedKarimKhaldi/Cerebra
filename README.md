@@ -64,35 +64,44 @@ python scripts/download_data.py            # → data/Task01_BrainTumour/
 
 The dataset is the **MSD Task01_BrainTumour** cohort, openly mirrored on S3. It ships 484 studies, each with 4 co-registered MRI channels and an expert tumour annotation. Cerebra reframes the labels as **binary whole-tumour** (any tumour vs. background) — exactly the Stage-1 triage question, and far faster to train reliably than the 3-class problem.
 
-### 2. Train + calibrate
+### 2. Train + calibrate (GPU)
+
+The training pipeline auto-detects CUDA and uses mixed precision when a GPU is present. The **recommended full run** on a local GPU:
 
 ```bash
-# Full training (GPU strongly recommended — targets clinical-grade Dice)
-python scripts/train_model.py --architecture swinunetr --max-epochs 300
+# Clinical-grade target: full 484-study dataset, Swin UNETR, 300 epochs
+python scripts/train_model.py --architecture swinunetr --roi 128 128 128 --max-epochs 300
 
-# Fast CPU proof-of-learning run (small subset, capped steps)
-python scripts/train_model.py \
-    --limit-studies 24 --max-epochs 8 --max-train-steps 20 --roi 96 96 96
+# Lighter/faster GPU baseline: SegResNet on the full dataset
+python scripts/train_model.py --architecture segresnet --roi 128 128 128 --max-epochs 150
 ```
 
-Training does DiceCE loss, AdamW + cosine LR, patch-based sampling, sliding-window validation with a real Dice metric, and best-Dice checkpointing. After the best checkpoint is chosen, **temperature scaling** is fit on the validation set and written back into the checkpoint (`temperature`, plus `ece_before`/`ece_after`).
+Training uses DiceCE loss, AdamW + cosine LR, AMP (CUDA), patch-based sampling, sliding-window validation with a real Dice metric, and best-Dice checkpointing. After the best checkpoint is chosen, **temperature scaling** is fit on the validation set and written back into the checkpoint (`temperature`, `ece_before`, `ece_after`).
 
-> **Honest note on compute.** A 3-D segmentation network reaches clinical-grade whole-tumour Dice (~0.85+) only with a GPU and many epochs. On CPU the same pipeline still learns genuine tumour features and produces a real, non-random, calibrated checkpoint — enough to demonstrate the end-to-end claim — but it is **not** a converged clinical model. The `--limit-studies` / `--max-train-steps` flags exist for exactly this CPU demonstration.
+Expect a full GPU run to reach whole-tumour Dice in the **~0.85–0.90** range (the standard BraTS whole-tumour ceiling). A single 16 GB GPU handles `--roi 128 128 128` at `batch_size 1`; drop to `--roi 96 96 96` if you hit out-of-memory.
 
-### Demonstrated result (shipped checkpoint)
+### 3. Evaluate the trained model
 
-`models/cerebra_whole_tumour.pt` is a real model produced by a bounded CPU run
-(SegResNet, 48 train / 12 val studies, ROI 96³):
+```bash
+python scripts/evaluate.py --limit-studies 0 --csv eval_percase.csv
+```
 
-| Metric | Value |
-|---|---|
-| Best validation whole-tumour Dice | **0.70** |
-| Calibration temperature (fitted) | 0.334 |
-| Expected Calibration Error | **0.218 → 0.057** after temperature scaling |
-| End-to-end per-case Dice on a held-out real study | 0.61 |
+Reports mean/per-case whole-tumour Dice **using the same calibrated 0.5 threshold the triage pipeline applies**, Expected Calibration Error before/after temperature, and the FLAG/CLEAR triage confusion counts. Writing the per-case CSV lets you spot failure cases.
 
-The calibration step more than halved ECE, so the reported tumour probability is
-trustworthy. Retrain on GPU for clinical-grade Dice.
+> **CPU fallback (this repo's shipped checkpoint).** Everything above also runs on CPU, just far slower. The checkpoint committed here, `models/cerebra_whole_tumour.pt`, came from a **bounded CPU run** (SegResNet, 48 train / 12 val studies, ROI 96³) used to prove the pipeline end-to-end. For a real deployment, retrain locally on GPU with the commands above — your run overwrites this checkpoint.
+>
+> | Metric (shipped CPU checkpoint) | Value |
+> |---|---|
+> | Best validation whole-tumour Dice | 0.70 |
+> | Fitted temperature | 0.334 |
+> | Expected Calibration Error | 0.218 → 0.057 after temperature scaling |
+> | Per-case Dice on a held-out real study | 0.61 (correctly FLAGged) |
+
+For a quick CPU sanity run (no GPU, minutes):
+
+```bash
+python scripts/train_model.py --limit-studies 24 --max-epochs 8 --max-train-steps 20 --roi 96 96 96
+```
 
 ---
 
@@ -109,13 +118,19 @@ trustworthy. Retrain on GPU for clinical-grade Dice.
 git clone https://github.com/mohammedkarimkhaldi/cerebra.git
 cd cerebra
 
-# Create virtual environment and install all dependencies (CPU PyTorch)
 uv venv --python 3.11
-uv pip install -e "." --extra-index-url https://download.pytorch.org/whl/cpu
 
-# Install dev dependencies
+# GPU (recommended for local runs): default PyPI PyTorch wheels are CUDA-enabled
+uv pip install -e "."
+
+# — or — CPU-only host: use the CPU wheel index
+# uv pip install -e "." --extra-index-url https://download.pytorch.org/whl/cpu
+
+# Dev dependencies (tests)
 uv pip install pytest pytest-cov pytest-asyncio
 ```
+
+Verify the GPU is visible: `python -c "import torch; print(torch.cuda.is_available())"` should print `True`.
 
 ---
 
@@ -215,15 +230,24 @@ fall back to the untrained model. Coverage on the pure-logic modules:
 
 ## Docker
 
-Build and run:
+**GPU image** (`docker/Dockerfile.gpu`, CUDA base — for local training + fast inference; needs the NVIDIA Container Toolkit):
+
+```bash
+docker build -f docker/Dockerfile.gpu -t cerebra:gpu .
+
+# Train on the GPU (mount data + models so the checkpoint persists)
+docker run --gpus all -v $PWD/data:/app/data -v $PWD/models:/app/models \
+    cerebra:gpu python scripts/train_model.py --architecture swinunetr --max-epochs 300
+
+# Serve the API on the GPU
+docker run --gpus all -v $PWD/models:/app/models -p 8000:8000 cerebra:gpu
+```
+
+**CPU image** (`docker/Dockerfile`, for inference/demo only):
 
 ```bash
 docker build -f docker/Dockerfile -t cerebra:latest .
-
-# Run the API
 docker run -p 8000:8000 cerebra:latest
-
-# Smoke test inside container
 docker run --rm cerebra:latest python scripts/run_demo.py
 ```
 
@@ -260,9 +284,11 @@ cerebra/
 │   ├── make_synthetic_sample.py
 │   ├── download_data.py   # fetch + extract public MSD Task01_BrainTumour
 │   ├── train_model.py     # train + calibrate on real data
+│   ├── evaluate.py        # Dice + calibration + triage confusion on held-out data
 │   └── run_demo.py        # end-to-end demo against synthetic sample
 └── docker/
-    └── Dockerfile
+    ├── Dockerfile         # CPU image (inference/demo)
+    └── Dockerfile.gpu     # CUDA image (local training + fast inference)
 ```
 
 ---

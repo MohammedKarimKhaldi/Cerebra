@@ -1,0 +1,43 @@
+# Cerebra Triage — CUDA (GPU) image for local training + fast inference.
+#
+# Build:  docker build -f docker/Dockerfile.gpu -t cerebra:gpu .
+# Train:  docker run --gpus all -v $PWD/data:/app/data -v $PWD/models:/app/models \
+#             cerebra:gpu python scripts/train_model.py --architecture swinunetr --max-epochs 300
+# Serve:  docker run --gpus all -v $PWD/models:/app/models -p 8000:8000 cerebra:gpu
+#
+# Requires the NVIDIA Container Toolkit on the host (`--gpus all`).
+
+FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04 AS base
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3.11 python3.11-venv python3-pip git && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir uv==0.8.17
+
+WORKDIR /app
+
+COPY pyproject.toml README.md ./
+# Default PyPI torch wheels are CUDA-enabled — no CPU extra-index here.
+RUN uv venv /opt/venv --python 3.11 && \
+    uv pip install --python /opt/venv/bin/python -e "." && \
+    /opt/venv/bin/python -c "import cerebra; print('import ok')"
+
+ENV PATH="/opt/venv/bin:$PATH"
+
+COPY src/ ./src/
+COPY scripts/ ./scripts/
+COPY README.md pyproject.toml ./
+
+RUN python scripts/make_synthetic_sample.py --output-dir /app/tests/fixtures/synthetic && \
+    mkdir -p /app/models /app/data
+
+EXPOSE 8000
+
+# Default: serve the API. Override the command to train (see header).
+CMD ["uvicorn", "cerebra.api:app", "--host", "0.0.0.0", "--port", "8000"]
