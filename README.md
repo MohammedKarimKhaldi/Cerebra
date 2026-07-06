@@ -186,26 +186,44 @@ cerebra-triage /path/to/study_dir --study-id patient_001
 
 ---
 
-## HTTP API
+## Web UI (easiest way to use it)
 
-Start the server:
+Start the server and open the page in a browser — no command line needed after that:
 
 ```bash
 uvicorn cerebra.api:app --host 0.0.0.0 --port 8000
+# then open http://localhost:8000
 ```
 
-Submit a study (zip the NIfTI directory first):
+Drop the four MRI channels (T1, T1ce, T2, FLAIR) into their slots and click **Run triage**. You get the FLAG/CLEAR decision, the calibrated tumour probability, volume / diameter / region, and the segmentation overlay — all in the page.
+
+![Cerebra web UI](docs/ui.png)
+
+The header shows which model is loaded (`trained`, `bundle`, or `fallback`).
+
+## HTTP API
+
+The UI is backed by a small REST API you can also call directly:
+
+| Method | Route | Body | Returns |
+|---|---|---|---|
+| `GET` | `/` | – | the web UI |
+| `POST` | `/triage/files` | 4 files: `t1`, `t1ce`, `t2`, `flair` | `TriageReport` JSON |
+| `POST` | `/triage` | one `file` = zip/tar.gz of a study dir | `TriageReport` JSON |
+| `GET` | `/overlay/{study_id}` | – | overlay PNG |
+| `GET` | `/health` | – | model status |
 
 ```bash
-cd /path/to/study_dir && zip -r /tmp/study.zip .
-curl -F "file=@/tmp/study.zip" http://localhost:8000/triage
+# four loose NIfTI channels
+curl -F t1=@t1.nii.gz -F t1ce=@t1ce.nii.gz -F t2=@t2.nii.gz -F flair=@flair.nii.gz \
+     http://localhost:8000/triage/files
+
+# or a zipped study directory
+cd /path/to/study_dir && zip -r /tmp/study.zip . && curl -F file=@/tmp/study.zip \
+     http://localhost:8000/triage
 ```
 
-Other endpoints:
-- `GET /health` — liveness check
-- `GET /overlay/{study_id}` — retrieve the PNG overlay
-
-Interactive docs: http://localhost:8000/docs
+Interactive OpenAPI docs: http://localhost:8000/docs
 
 ---
 
@@ -273,7 +291,9 @@ cerebra/
 │   ├── viz.py             # axial-slice overlay rendering with matplotlib
 │   ├── pipeline.py        # orchestrates preprocess → infer → postprocess → report
 │   ├── cli.py             # cerebra-triage entry point (Typer)
-│   └── api.py             # FastAPI app with POST /triage
+│   ├── api.py             # FastAPI app: web UI + triage endpoints
+│   └── static/
+│       └── index.html     # single-page web UI (served at /)
 ├── tests/
 │   ├── conftest.py        # builds synthetic fixture
 │   ├── test_postprocess.py
