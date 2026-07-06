@@ -180,17 +180,21 @@ def build_loaders(
     cache_rate: float = 0.0,
 ) -> tuple[DataLoader, DataLoader]:
     """Build cached train/val DataLoaders from manifest file lists."""
-    train_ds = CacheDataset(
-        data=train_files, transform=train_transforms(roi_size),
-        cache_rate=cache_rate, num_workers=num_workers,
-    )
+    # Allow an empty train set (e.g. calibration-only runs need just the val loader).
+    train_loader = None
+    if train_files:
+        train_ds = CacheDataset(
+            data=train_files, transform=train_transforms(roi_size),
+            cache_rate=cache_rate, num_workers=num_workers,
+        )
+        train_loader = DataLoader(
+            train_ds, batch_size=batch_size, shuffle=True,
+            num_workers=num_workers, pin_memory=False,
+        )
+
     val_ds = CacheDataset(
         data=val_files, transform=val_transforms(),
         cache_rate=cache_rate, num_workers=num_workers,
-    )
-    train_loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True,
-        num_workers=num_workers, pin_memory=False,
     )
     val_loader = DataLoader(
         val_ds, batch_size=1, shuffle=False,

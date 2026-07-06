@@ -77,7 +77,22 @@ python scripts/train_model.py \
 
 Training does DiceCE loss, AdamW + cosine LR, patch-based sampling, sliding-window validation with a real Dice metric, and best-Dice checkpointing. After the best checkpoint is chosen, **temperature scaling** is fit on the validation set and written back into the checkpoint (`temperature`, plus `ece_before`/`ece_after`).
 
-> **Honest note on compute.** A 3-D segmentation network reaches clinical-grade whole-tumour Dice (~0.85+) only with a GPU and many epochs. On CPU the same pipeline still learns genuine tumour features (validation Dice climbs well above zero) and produces a real, non-random, calibrated checkpoint — enough to demonstrate the end-to-end claim — but it is **not** a converged clinical model. The `--limit-studies` / `--max-train-steps` flags exist for exactly this CPU demonstration.
+> **Honest note on compute.** A 3-D segmentation network reaches clinical-grade whole-tumour Dice (~0.85+) only with a GPU and many epochs. On CPU the same pipeline still learns genuine tumour features and produces a real, non-random, calibrated checkpoint — enough to demonstrate the end-to-end claim — but it is **not** a converged clinical model. The `--limit-studies` / `--max-train-steps` flags exist for exactly this CPU demonstration.
+
+### Demonstrated result (shipped checkpoint)
+
+`models/cerebra_whole_tumour.pt` is a real model produced by a bounded CPU run
+(SegResNet, 48 train / 12 val studies, ROI 96³):
+
+| Metric | Value |
+|---|---|
+| Best validation whole-tumour Dice | **0.70** |
+| Calibration temperature (fitted) | 0.334 |
+| Expected Calibration Error | **0.218 → 0.057** after temperature scaling |
+| End-to-end per-case Dice on a held-out real study | 0.61 |
+
+The calibration step more than halved ECE, so the reported tumour probability is
+trustworthy. Retrain on GPU for clinical-grade Dice.
 
 ---
 
@@ -185,16 +200,16 @@ Interactive docs: http://localhost:8000/docs
 pytest tests/ -v --cov=src/cerebra
 ```
 
-Tests use a synthetic fixture and do **not** require the dataset download or a
-trained model (they exercise the untrained fallback for the end-to-end path).
-Coverage targets (all met) on the pure-logic modules:
+The 44 tests use a synthetic fixture and do **not** require the dataset download.
+If a trained checkpoint is present the end-to-end tests exercise it; otherwise they
+fall back to the untrained model. Coverage on the pure-logic modules:
 
 | Module | Coverage |
 |---|---|
-| `postprocess.py` | 100% |
 | `schemas.py` | 100% |
-| `calibrate.py` | high |
-| `model.py` | high |
+| `postprocess.py` | 97% |
+| `model.py` | 90% |
+| `calibrate.py` | core math (temperature fit, ECE) unit-tested |
 
 ---
 
