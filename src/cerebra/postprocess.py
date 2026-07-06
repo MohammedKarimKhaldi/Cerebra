@@ -1,16 +1,19 @@
-"""Post-process the model probability map into triage metrics.
+"""Post-process a tumour probability map into triage metrics.
 
 All public functions are pure (no I/O, no global state) so they are easy to unit test.
 
+Input contract: a single-channel calibrated P(tumour) map of shape (H, W, D), as
+produced by `inference.run_inference`. Because the probability is temperature-scaled,
+thresholds and the reported confidence are meaningful, not just monotonic scores.
+
 Triage rule (POC):
-  FLAG  if tumour_volume_mm3 >= 250 AND max_segmentation_probability >= 0.5
+  FLAG  if tumour_volume_mm3 >= 250 AND study_tumour_probability >= 0.5
   CLEAR otherwise
 
-Confidence = max softmax probability inside the largest connected component,
-             clipped to [0, 1].
+Confidence = calibrated study-level tumour probability (see `study_tumour_probability`).
 
 Anatomical region: bounding-box heuristic splitting the volume into left/right ×
-frontal/parietal/occipital thirds. This is a placeholder — see TODO below.
+frontal/temporal/occipital thirds. This is a placeholder — see TODO below.
 
 # TODO(real-product): replace bounding-box region mapping with atlas-based
 #   registration (e.g., MNI152 via ANTs/SimpleITK) for clinically valid localisation.
@@ -28,18 +31,25 @@ from cerebra.schemas import Findings, TriageDecision
 VOLUME_THRESHOLD_MM3 = 250.0
 PROB_THRESHOLD = 0.5
 
-# Voxel volume for 1 mm³ isotropic images (TARGET_SPACING = 1,1,1)
+# Voxel volume for 1 mm³ isotropic images (preprocessing resamples to 1,1,1)
 VOXEL_VOLUME_MM3 = 1.0
 
 
-def tumour_probability_map(probs: torch.Tensor) -> np.ndarray:
-    """Collapse 4-class prob map to a single 'tumour present' probability.
+def to_prob_map(probs: np.ndarray | torch.Tensor) -> np.ndarray:
+    """Coerce model output into a single-channel (H, W, D) float32 P(tumour) map.
 
-    probs: (1, 4, H, W, D)  — class 0 is background; 1–3 are tumour sub-regions.
-    Returns (H, W, D) float32 array: P(any tumour class).
+    Accepts either an already-collapsed (H, W, D) map (our binary model, the normal
+    case) or a legacy 4-class (1, 4, H, W, D) tensor (bundle path), collapsing the
+    latter to P(any tumour) = 1 - P(background).
     """
-    tumour_prob = 1.0 - probs[0, 0].numpy()  # P(not background) == P(any tumour)
-    return tumour_prob.astype(np.float32)
+    if isinstance(probs, torch.Tensor):
+        probs = probs.detach().cpu().numpy()
+    probs = np.asarray(probs)
+    if probs.ndim == 5:  # (1, C, H, W, D)
+        return (1.0 - probs[0, 0]).astype(np.float32)
+    if probs.ndim == 4:  # (C, H, W, D)
+        return (1.0 - probs[0]).astype(np.float32)
+    return probs.astype(np.float32)
 
 
 def threshold_and_label(prob_map: np.ndarray, threshold: float = PROB_THRESHOLD) -> np.ndarray:
@@ -61,7 +71,7 @@ def largest_component(label_map: np.ndarray) -> np.ndarray:
         return np.zeros_like(label_map, dtype=bool)
     counts = ndi.sum(np.ones_like(label_map), label_map, range(1, label_map.max() + 1))
     best_label = int(np.argmax(counts)) + 1  # labels are 1-indexed
-    return (label_map == best_label)
+    return label_map == best_label
 
 
 def compute_volume_mm3(mask: np.ndarray, voxel_volume: float = VOXEL_VOLUME_MM3) -> float:
@@ -99,10 +109,8 @@ def map_anatomical_region(mask: np.ndarray, volume_shape: tuple[int, int, int]) 
     centroid = np.array(ndi.center_of_mass(mask))
     h, w, d = volume_shape
 
-    # Left / Right along x-axis
     side = "left" if centroid[0] < h / 2 else "right"
 
-    # Frontal / Temporal / Occipital thirds along y-axis
     y_frac = centroid[1] / w
     if y_frac < 1 / 3:
         lobe = "frontal"
@@ -114,47 +122,58 @@ def map_anatomical_region(mask: np.ndarray, volume_shape: tuple[int, int, int]) 
     return f"{side} {lobe}"
 
 
-def compute_confidence(prob_map: np.ndarray, mask: np.ndarray) -> float:
-    """Return max segmentation probability inside the component, clipped to [0, 1]."""
+def study_tumour_probability(prob_map: np.ndarray, mask: np.ndarray) -> float:
+    """Calibrated study-level P(tumour), clipped to [0, 1].
+
+    Rather than a single hottest voxel (noisy) or the whole-region mean (diluted by
+    partial-volume edges), we take the mean of the most-confident voxels inside the
+    largest component. This is a stable summary of "how tumour-like is the flagged
+    region", and because the map is temperature-calibrated it reads as a genuine
+    probability. Empty mask → 0.0.
+    """
     if not mask.any():
         return 0.0
-    return float(np.clip(prob_map[mask].max(), 0.0, 1.0))
+    vals = prob_map[mask]
+    # top decile (at least one voxel) of the component's probabilities
+    k = max(1, int(vals.size * 0.1))
+    top = np.sort(vals)[-k:]
+    return float(np.clip(top.mean(), 0.0, 1.0))
 
 
-def make_triage_decision(volume_mm3: float, confidence: float) -> TriageDecision:
-    """Apply the POC triage rule: FLAG if volume ≥ 250 mm³ AND confidence ≥ 0.5."""
-    if volume_mm3 >= VOLUME_THRESHOLD_MM3 and confidence >= PROB_THRESHOLD:
+def make_triage_decision(volume_mm3: float, probability: float) -> TriageDecision:
+    """Apply the POC triage rule: FLAG if volume ≥ 250 mm³ AND probability ≥ 0.5."""
+    if volume_mm3 >= VOLUME_THRESHOLD_MM3 and probability >= PROB_THRESHOLD:
         return TriageDecision.FLAG
     return TriageDecision.CLEAR
 
 
 def postprocess(
-    probs: torch.Tensor,
+    prob_map: np.ndarray | torch.Tensor,
     volume_shape: tuple[int, int, int],
 ) -> tuple[Findings, TriageDecision, float, np.ndarray]:
-    """Run the full postprocessing pipeline on the model output.
+    """Run the full postprocessing pipeline on a calibrated tumour probability map.
 
     Args:
-        probs: (1, 4, H, W, D) softmax probability tensor from the model.
+        prob_map: (H, W, D) calibrated P(tumour), or a legacy 4-class tensor.
         volume_shape: (H, W, D) of the preprocessed input (used for region mapping).
 
     Returns:
         findings, triage_decision, confidence, largest_component_mask
     """
-    prob_map = tumour_probability_map(probs)
+    prob_map = to_prob_map(prob_map)
     label_map = threshold_and_label(prob_map)
     component = largest_component(label_map)
 
     volume_mm3 = compute_volume_mm3(component)
     diameter_mm = compute_max_diameter_mm(component)
     region = map_anatomical_region(component, volume_shape)
-    confidence = compute_confidence(prob_map, component)
-    decision = make_triage_decision(volume_mm3, confidence)
+    probability = study_tumour_probability(prob_map, component)
+    decision = make_triage_decision(volume_mm3, probability)
 
     findings = Findings(
-        tumour_suspected=component.any(),
+        tumour_suspected=bool(component.any()),
         tumour_volume_mm3=volume_mm3,
         anatomical_region=region,
         max_diameter_mm=diameter_mm,
     )
-    return findings, decision, confidence, component
+    return findings, decision, probability, component

@@ -9,41 +9,47 @@ import torch
 from cerebra.postprocess import (
     PROB_THRESHOLD,
     VOLUME_THRESHOLD_MM3,
-    compute_confidence,
     compute_max_diameter_mm,
     compute_volume_mm3,
     largest_component,
     make_triage_decision,
     map_anatomical_region,
     postprocess,
+    study_tumour_probability,
     threshold_and_label,
-    tumour_probability_map,
+    to_prob_map,
 )
 from cerebra.schemas import TriageDecision
 
 
-# --- tumour_probability_map ---
+# --- to_prob_map ---
 
-def test_tumour_probability_map_all_background():
-    probs = torch.zeros(1, 4, 10, 10, 10)
-    probs[0, 0] = 1.0
-    result = tumour_probability_map(probs)
-    assert result.shape == (10, 10, 10)
-    assert np.allclose(result, 0.0)
-
-
-def test_tumour_probability_map_full_tumour():
-    probs = torch.zeros(1, 4, 10, 10, 10)
-    probs[0, 1] = 1.0
-    result = tumour_probability_map(probs)
-    assert np.allclose(result, 1.0)
+def test_to_prob_map_passthrough_3d():
+    m = np.random.rand(10, 10, 10).astype(np.float32)
+    out = to_prob_map(m)
+    assert out.shape == (10, 10, 10)
+    assert np.allclose(out, m)
 
 
-def test_tumour_probability_map_uses_synthetic_probs(synthetic_probs):
-    result = tumour_probability_map(synthetic_probs)
-    assert result.shape == (120, 120, 80)
-    # Should have high probability somewhere
-    assert result.max() > 0.5
+def test_to_prob_map_from_4class_tensor():
+    probs = torch.zeros(1, 4, 8, 8, 8)
+    probs[0, 0] = 1.0  # all background
+    out = to_prob_map(probs)
+    assert out.shape == (8, 8, 8)
+    assert np.allclose(out, 0.0)
+
+
+def test_to_prob_map_4class_full_tumour():
+    probs = torch.zeros(1, 4, 8, 8, 8)
+    probs[0, 1] = 1.0  # class-1 tumour everywhere; background=0
+    out = to_prob_map(probs)
+    assert np.allclose(out, 1.0)
+
+
+def test_to_prob_map_accepts_torch_3d():
+    m = torch.rand(6, 6, 6)
+    out = to_prob_map(m)
+    assert out.shape == (6, 6, 6)
 
 
 # --- threshold_and_label ---
@@ -72,13 +78,11 @@ def test_largest_component_empty():
 
 def test_largest_component_picks_bigger():
     prob_map = np.zeros((20, 20, 20), dtype=np.float32)
-    prob_map[1:4, 1:4, 1:4] = 0.9    # small blob
-    prob_map[10:16, 10:16, 10:16] = 0.9  # big blob
+    prob_map[1:4, 1:4, 1:4] = 0.9
+    prob_map[10:16, 10:16, 10:16] = 0.9
     labels = threshold_and_label(prob_map)
     mask = largest_component(labels)
-    # centroid of big blob should be inside mask
     assert mask[13, 13, 13]
-    # centroid of small blob should not be inside mask
     assert not mask[2, 2, 2]
 
 
@@ -97,7 +101,6 @@ def test_volume_mm3_known_value():
 
 def test_volume_mm3_custom_voxel_size():
     mask = np.ones((10, 10, 10), dtype=bool)
-    # 1000 voxels × 2.0 mm³ each
     assert compute_volume_mm3(mask, voxel_volume=2.0) == pytest.approx(2000.0)
 
 
@@ -123,32 +126,39 @@ def test_region_unknown_when_empty():
 
 def test_region_right_frontal():
     mask = np.zeros((100, 100, 80), dtype=bool)
-    # centroid at (70, 10, 40) → right (x>50), frontal (y/100 < 1/3)
-    mask[65:75, 5:15, 35:45] = True
-    region = map_anatomical_region(mask, (100, 100, 80))
-    assert region == "right frontal"
+    mask[65:75, 5:15, 35:45] = True   # right (x>50), frontal (y/100 < 1/3)
+    assert map_anatomical_region(mask, (100, 100, 80)) == "right frontal"
 
 
 def test_region_left_occipital():
     mask = np.zeros((100, 100, 80), dtype=bool)
-    # centroid at (20, 90, 40) → left (x<50), occipital (y/100 > 2/3)
-    mask[15:25, 85:95, 35:45] = True
-    region = map_anatomical_region(mask, (100, 100, 80))
-    assert region == "left occipital"
+    mask[15:25, 85:95, 35:45] = True  # left (x<50), occipital (y/100 > 2/3)
+    assert map_anatomical_region(mask, (100, 100, 80)) == "left occipital"
 
 
-# --- compute_confidence ---
+# --- study_tumour_probability ---
 
-def test_confidence_zero_when_no_mask():
+def test_study_probability_zero_when_no_mask():
     prob_map = np.ones((10, 10, 10), dtype=np.float32) * 0.7
     mask = np.zeros((10, 10, 10), dtype=bool)
-    assert compute_confidence(prob_map, mask) == 0.0
+    assert study_tumour_probability(prob_map, mask) == 0.0
 
 
-def test_confidence_clipped():
+def test_study_probability_clipped_and_high():
     prob_map = np.full((10, 10, 10), 1.5, dtype=np.float32)  # over 1
     mask = np.ones((10, 10, 10), dtype=bool)
-    assert compute_confidence(prob_map, mask) == pytest.approx(1.0)
+    assert study_tumour_probability(prob_map, mask) == pytest.approx(1.0)
+
+
+def test_study_probability_uses_top_decile():
+    prob_map = np.zeros((10, 10, 10), dtype=np.float32)
+    mask = np.ones((10, 10, 10), dtype=bool)
+    prob_map[...] = 0.2
+    # make 10% of voxels very confident
+    flat = prob_map.reshape(-1)
+    flat[:100] = 0.95
+    val = study_tumour_probability(prob_map.reshape(10, 10, 10), mask)
+    assert val > 0.5   # dominated by the confident decile, not the 0.2 background
 
 
 # --- make_triage_decision ---
@@ -167,10 +177,26 @@ def test_clear_when_confidence_too_low():
 
 # --- end-to-end postprocess ---
 
-def test_postprocess_with_synthetic_probs(synthetic_probs):
-    findings, decision, confidence, mask = postprocess(synthetic_probs, (120, 120, 80))
+def test_postprocess_with_prob_map(synthetic_prob_map):
+    findings, decision, confidence, mask = postprocess(synthetic_prob_map, (120, 120, 80))
     assert findings.tumour_suspected
     assert findings.tumour_volume_mm3 > 0
     assert 0.0 <= confidence <= 1.0
-    assert decision in (TriageDecision.FLAG, TriageDecision.CLEAR)
+    assert decision == TriageDecision.FLAG   # big, confident blob
     assert mask.shape == (120, 120, 80)
+    assert findings.anatomical_region == "right frontal"
+
+
+def test_postprocess_with_legacy_4class(synthetic_probs):
+    findings, decision, confidence, mask = postprocess(synthetic_probs, (120, 120, 80))
+    assert findings.tumour_suspected
+    assert 0.0 <= confidence <= 1.0
+    assert mask.shape == (120, 120, 80)
+
+
+def test_postprocess_clear_when_empty():
+    empty = np.zeros((60, 60, 40), dtype=np.float32)
+    findings, decision, confidence, mask = postprocess(empty, (60, 60, 40))
+    assert not findings.tumour_suspected
+    assert decision == TriageDecision.CLEAR
+    assert confidence == 0.0

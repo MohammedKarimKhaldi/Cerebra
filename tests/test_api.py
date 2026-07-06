@@ -74,7 +74,7 @@ def test_triage_model_metadata(client, study_zip):
     )
     assert response.status_code == 200
     meta = response.json()["model_metadata"]
-    assert meta["model_id"] == "brats_mri_segmentation"
+    assert "cerebra_whole_tumour" in meta["model_id"]
     assert meta["inference_time_ms"] >= 0
 
 

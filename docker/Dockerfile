@@ -1,5 +1,11 @@
 # Cerebra Triage POC — CPU-only image
 # Multi-stage: build installs deps; runtime image is lean.
+#
+# The trained checkpoint (models/cerebra_whole_tumour.pt) is NOT baked in — it is
+# large and produced by `scripts/train_model.py`. Mount it at runtime:
+#   docker run -v $PWD/models:/app/models -p 8000:8000 cerebra:latest
+# Without a checkpoint or the MONAI bundle, the service runs on the untrained
+# fallback (smoke-test only), which is logged loudly.
 
 FROM python:3.11-slim AS base
 
@@ -7,7 +13,6 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
-# Install uv
 RUN pip install uv==0.8.17
 
 WORKDIR /app
@@ -33,20 +38,12 @@ COPY src/ ./src/
 COPY scripts/ ./scripts/
 COPY README.md pyproject.toml ./
 
-# Pre-generate synthetic fixture so the smoke test works offline
+# Pre-generate synthetic fixture so the smoke demo works offline
 RUN python scripts/make_synthetic_sample.py \
       --output-dir /app/tests/fixtures/synthetic
 
-# Create model cache dir
-RUN mkdir -p /app/models
-
-# Download the MONAI bundle at build time so the first request is fast.
-# If the download fails (no internet at build time), the container still starts
-# and will use the fallback model.
-RUN python -m monai.bundle download \
-      --name brats_mri_segmentation \
-      --bundle_dir /app/models \
-    || echo "WARNING: bundle download failed — will use fallback model"
+# Model cache dir — mount a trained checkpoint here at runtime
+RUN mkdir -p /app/models /app/data
 
 EXPOSE 8000
 

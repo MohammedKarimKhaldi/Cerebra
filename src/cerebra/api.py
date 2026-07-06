@@ -38,11 +38,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Load model weights once at startup; release on shutdown."""
     device = get_device()
     log.info("api.lifespan", status="loading_model", device=str(device))
-    model, version = load_model(device=device)
-    _model_state["model"] = model
-    _model_state["version"] = version
+    loaded = load_model(device=device)
+    _model_state["loaded"] = loaded
     _model_state["device"] = device
-    log.info("api.lifespan", status="ready", model_version=version)
+    log.info("api.lifespan", status="ready", kind=loaded.kind, model_version=loaded.version)
     yield
     _model_state.clear()
     log.info("api.lifespan", status="shutdown")
@@ -106,8 +105,7 @@ async def triage_endpoint(file: UploadFile = File(..., description="zip or tar.g
 
         report = run_triage(
             input_path=study_dir,
-            model=_model_state.get("model"),
-            model_version=_model_state.get("version", "unknown"),
+            model=_model_state.get("loaded"),
             output_dir=output_dir,
             study_id=study_id,
         )
@@ -137,5 +135,11 @@ async def get_overlay(study_id: str) -> FileResponse:
 
 @app.get("/health")
 async def health() -> dict:
-    """Liveness check."""
-    return {"status": "ok", "model_loaded": bool(_model_state.get("model"))}
+    """Liveness check — reports which model kind is loaded."""
+    loaded = _model_state.get("loaded")
+    return {
+        "status": "ok",
+        "model_loaded": loaded is not None,
+        "model_kind": loaded.kind if loaded else None,
+        "model_version": loaded.version if loaded else None,
+    }

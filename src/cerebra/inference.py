@@ -1,196 +1,190 @@
-"""MONAI bundle wrapper for brats_mri_segmentation sliding-window inference.
+"""Inference: load a segmentation model and produce a calibrated tumour probability map.
 
-Downloads the bundle on first run and caches it under ./models/.
-Returns a (1, 4, H, W, D) per-class probability map (softmax output).
+Model resolution order (first available wins):
+  1. **Cerebra trained checkpoint** (`models/cerebra_whole_tumour.pt`) — our own binary
+     whole-tumour model trained on real MSD data, with temperature-scaled calibration.
+  2. **MONAI bundle** `brats_mri_segmentation` — a pretrained 4-class BraTS model.
+  3. **Untrained fallback** — random-weight SegResNet, for structural smoke tests ONLY.
+     This path is logged loudly and its outputs are not meaningful.
 
-The brats_mri_segmentation bundle produces 4 output classes:
-  0 = background
-  1 = necrotic core (NCR/NET)
-  2 = peritumoral oedema (ED)
-  3 = GD-enhancing tumour (ET)
-
-For triage we combine classes 1–3 into a single "tumour present" map.
+Whatever the source, `run_inference` returns a single-channel calibrated probability
+map P(tumour) of shape (H, W, D), so all downstream code has one contract.
 """
 
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import structlog
 import torch
-from monai.inferers import SlidingWindowInferer
-from monai.networks.nets import SegResNet
+from monai.inferers import sliding_window_inference
+
+from cerebra.calibrate import apply_temperature
 
 log = structlog.get_logger()
 
-BUNDLE_NAME = "brats_mri_segmentation"
 MODELS_DIR = Path(__file__).parent.parent.parent / "models"
+TRAINED_CHECKPOINT = MODELS_DIR / "cerebra_whole_tumour.pt"
+BUNDLE_NAME = "brats_mri_segmentation"
 
-# Sliding-window parameters — smaller ROI reduces RAM on CPU
-ROI_SIZE = (128, 128, 64)
+# Sliding-window parameters
+ROI_SIZE = (128, 128, 128)
 SW_BATCH_SIZE = 1
 OVERLAP = 0.25
+NUM_CLASSES = 4  # bundle path
 
-# Number of output classes from the BraTS bundle
-NUM_CLASSES = 4
+
+@dataclass
+class LoadedModel:
+    """A ready-to-run model plus the metadata needed to interpret its output."""
+
+    model: torch.nn.Module
+    kind: str            # "trained" | "bundle" | "fallback"
+    version: str
+    temperature: float = 1.0
+    roi_size: tuple[int, int, int] = ROI_SIZE
+    val_dice: float | None = None
 
 
 def get_device() -> torch.device:
     """Return CUDA device if available, else CPU."""
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    return torch.device("cpu")
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def _build_fallback_model(device: torch.device) -> torch.nn.Module:
-    """Construct an untrained SegResNet as a structural fallback.
+def _load_trained(device: torch.device) -> LoadedModel | None:
+    """Load our own trained + calibrated whole-tumour checkpoint if present."""
+    if not TRAINED_CHECKPOINT.exists():
+        return None
+    from cerebra.model import build_model
 
-    Used when the MONAI bundle download fails so the pipeline can still run
-    end-to-end in CI / demo mode. The weights are random — outputs are
-    meaningless for clinical use.
-
-    NOTE: this is intentionally only called when the real bundle is unavailable.
-    The main pipeline will log a clear warning.
-    """
-    model = SegResNet(
-        blocks_down=[1, 2, 2, 4],
-        blocks_up=[1, 1, 1],
-        init_filters=8,
-        in_channels=4,
-        out_channels=NUM_CLASSES,
-        dropout_prob=0.0,
-    ).to(device)
+    ckpt = torch.load(str(TRAINED_CHECKPOINT), map_location=device, weights_only=False)
+    roi = tuple(ckpt.get("roi_size", ROI_SIZE))
+    model = build_model(ckpt["architecture"], roi).to(device)
+    model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
-    return model
+    version = f"{ckpt['architecture']}-dice{ckpt.get('val_dice', 0):.3f}"
+    log.info(
+        "inference.load_trained",
+        architecture=ckpt["architecture"],
+        val_dice=ckpt.get("val_dice"),
+        temperature=ckpt.get("temperature", 1.0),
+        device=str(device),
+    )
+    return LoadedModel(
+        model=model, kind="trained", version=version,
+        temperature=float(ckpt.get("temperature", 1.0)),
+        roi_size=roi, val_dice=ckpt.get("val_dice"),
+    )
 
 
-def download_bundle(bundle_dir: Path = MODELS_DIR) -> Path:
-    """Download brats_mri_segmentation bundle if not already cached.
-
-    Returns the bundle directory path.
-    """
-    bundle_path = bundle_dir / BUNDLE_NAME
-    if bundle_path.exists():
-        log.info("inference.download_bundle", status="cached", path=str(bundle_path))
-        return bundle_path
-
-    bundle_dir.mkdir(parents=True, exist_ok=True)
-    log.info("inference.download_bundle", status="downloading", bundle=BUNDLE_NAME)
-    try:
-        from monai.bundle import download as bundle_download
-
-        bundle_download(name=BUNDLE_NAME, bundle_dir=str(bundle_dir))
-        log.info("inference.download_bundle", status="complete", path=str(bundle_path))
-    except Exception as exc:
-        log.warning(
-            "inference.download_bundle",
-            status="failed",
-            error=str(exc),
-            fallback="using untrained SegResNet",
-        )
-    return bundle_path
-
-
-def load_model(
-    bundle_dir: Path = MODELS_DIR,
-    device: torch.device | None = None,
-) -> tuple[torch.nn.Module, str]:
-    """Load the pretrained brats_mri_segmentation model.
-
-    Returns (model, version_string).  Falls back to untrained SegResNet if the
-    bundle cannot be loaded — clearly logged at WARNING level.
-    """
-    if device is None:
-        device = get_device()
-
-    bundle_path = download_bundle(bundle_dir)
-
+def _load_bundle(device: torch.device) -> LoadedModel | None:
+    """Load the pretrained MONAI brats_mri_segmentation bundle if downloaded."""
+    bundle_path = MODELS_DIR / BUNDLE_NAME
+    config_path = bundle_path / "configs" / "inference.json"
+    if not config_path.exists():
+        config_path = bundle_path / "configs" / "inference.yaml"
+    if not config_path.exists():
+        return None
     try:
         from monai.bundle import ConfigParser
 
-        config_path = bundle_path / "configs" / "inference.json"
-        if not config_path.exists():
-            config_path = bundle_path / "configs" / "inference.yaml"
-
         parser = ConfigParser()
         parser.read_config(str(config_path))
+        model = parser.get_parsed_content("network_def", instantiate=True)
 
-        # Resolve the network definition from the bundle config
-        model: torch.nn.Module = parser.get_parsed_content("network_def", instantiate=True)
-
-        # Load pretrained weights
         ckpt_dir = bundle_path / "models"
-        ckpt_candidates = list(ckpt_dir.glob("model*.pt")) + list(ckpt_dir.glob("*.pth"))
-        if ckpt_candidates:
-            ckpt = ckpt_candidates[0]
-            state = torch.load(str(ckpt), map_location=device, weights_only=True)
-            # Handle various checkpoint formats
+        ckpts = list(ckpt_dir.glob("model*.pt")) + list(ckpt_dir.glob("*.pth"))
+        if ckpts:
+            state = torch.load(str(ckpts[0]), map_location=device, weights_only=True)
             if isinstance(state, dict) and "state_dict" in state:
                 state = state["state_dict"]
-            elif isinstance(state, dict) and "model" in state:
-                state = state["model"]
             model.load_state_dict(state, strict=False)
-            log.info("inference.load_model", weights=str(ckpt), device=str(device))
-        else:
-            log.warning("inference.load_model", status="no_weights_found", path=str(ckpt_dir))
 
-        # Read version from metadata
         version = "unknown"
         meta_path = bundle_path / "configs" / "metadata.json"
         if meta_path.exists():
             import json
-            with open(meta_path) as f:
-                meta = json.load(f)
-            version = meta.get("version", version)
+            version = json.load(open(meta_path)).get("version", version)
 
         model = model.to(device).eval()
-        return model, version
-
+        log.info("inference.load_bundle", version=version, device=str(device))
+        return LoadedModel(model=model, kind="bundle", version=version, roi_size=(128, 128, 64))
     except Exception as exc:
-        log.warning(
-            "inference.load_model",
-            status="bundle_load_failed",
-            error=str(exc),
-            fallback="untrained SegResNet — outputs are NOT clinically valid",
-        )
-        model = _build_fallback_model(device)
-        return model, "fallback-untrained"
+        log.warning("inference.load_bundle", status="failed", error=str(exc))
+        return None
 
 
-def run_inference(
-    model: torch.nn.Module,
-    input_tensor: torch.Tensor,
-    device: torch.device | None = None,
-) -> tuple[torch.Tensor, int]:
-    """Run sliding-window inference on a (1, 4, H, W, D) tensor.
+def _load_fallback(device: torch.device) -> LoadedModel:
+    """Untrained SegResNet — smoke-test structural path only. NOT clinically valid."""
+    from monai.networks.nets import SegResNet
 
-    Returns (probability_map, inference_time_ms) where probability_map is
-    (1, 4, H, W, D) softmax probabilities over the 4 BraTS classes.
-    """
+    model = SegResNet(
+        blocks_down=[1, 2, 2, 4], blocks_up=[1, 1, 1], init_filters=8,
+        in_channels=4, out_channels=1, dropout_prob=0.0,
+    ).to(device).eval()
+    log.warning(
+        "inference.load_fallback",
+        status="UNTRAINED",
+        note="random weights — outputs are NOT clinically valid, smoke-test only",
+    )
+    return LoadedModel(model=model, kind="fallback", version="fallback-untrained")
+
+
+def load_model(device: torch.device | None = None, allow_fallback: bool = True) -> LoadedModel:
+    """Resolve the best available model: trained → bundle → (optional) fallback."""
     if device is None:
         device = get_device()
 
-    inferer = SlidingWindowInferer(
-        roi_size=ROI_SIZE,
-        sw_batch_size=SW_BATCH_SIZE,
-        overlap=OVERLAP,
-        mode="gaussian",
-        progress=False,
+    loaded = _load_trained(device) or _load_bundle(device)
+    if loaded is not None:
+        return loaded
+    if allow_fallback:
+        return _load_fallback(device)
+    raise FileNotFoundError(
+        "No trained checkpoint or MONAI bundle found. "
+        "Train one with `python scripts/train_model.py` or download the bundle."
     )
 
+
+def run_inference(
+    loaded: LoadedModel,
+    input_tensor: torch.Tensor,
+    device: torch.device | None = None,
+) -> tuple[torch.Tensor, int]:
+    """Run sliding-window inference and return a calibrated P(tumour) map.
+
+    Args:
+        loaded: a LoadedModel from `load_model`.
+        input_tensor: (1, 4, H, W, D) preprocessed scan.
+
+    Returns:
+        (tumour_prob_map, inference_time_ms) where tumour_prob_map is an (H, W, D)
+        float tensor of calibrated P(tumour) in [0, 1].
+    """
+    if device is None:
+        device = get_device()
     input_tensor = input_tensor.to(device)
 
     t0 = time.monotonic()
     with torch.no_grad():
-        logits = inferer(input_tensor, model)   # (1, 4, H, W, D)
-        probs = torch.softmax(logits, dim=1)    # per-class probabilities
+        logits = sliding_window_inference(
+            input_tensor, loaded.roi_size, SW_BATCH_SIZE, loaded.model,
+            overlap=OVERLAP, mode="gaussian",
+        )
+        if loaded.kind == "bundle":
+            # 4-class softmax → P(tumour) = 1 - P(background)
+            probs = torch.softmax(logits, dim=1)
+            tumour = 1.0 - probs[0, 0]
+        else:
+            # binary head → temperature-scaled sigmoid
+            tumour = apply_temperature(logits, loaded.temperature)[0, 0]
     elapsed_ms = int((time.monotonic() - t0) * 1000)
 
     log.info(
-        "inference.run_inference",
-        output_shape=list(probs.shape),
-        inference_time_ms=elapsed_ms,
-        device=str(device),
+        "inference.run", kind=loaded.kind, temperature=loaded.temperature,
+        inference_time_ms=elapsed_ms, device=str(device),
+        out_shape=list(tumour.shape),
     )
-    return probs.cpu(), elapsed_ms
+    return tumour.cpu(), elapsed_ms
