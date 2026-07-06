@@ -31,12 +31,15 @@ cerebra-triage = "cerebra.cli:app"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/cerebra"]
+# Ship the web UI asset with the package (matters for non-editable installs)
+force-include = { "src/cerebra/static" = "cerebra/static" }
 
 [tool.hatch.metadata]
 allow-direct-references = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["src"]
 addopts = "--cov=src/cerebra --cov-report=term-missing --cov-report=html"
 filterwarnings = [
     "ignore::DeprecationWarning",

@@ -24,25 +24,24 @@ def synthetic_study_dir() -> Path:
 
 
 @pytest.fixture(scope="session")
+def synthetic_prob_map() -> np.ndarray:
+    """(H, W, D) calibrated P(tumour) map with a synthetic tumour blob (right-frontal)."""
+    prob = np.zeros((120, 120, 80), dtype=np.float32)
+    cx, cy, cz = 78, 20, 32   # right (x>60), frontal (y/120 < 1/3)
+    prob[cx - 10:cx + 10, cy - 8:cy + 8, cz - 8:cz + 8] = 0.9
+    return prob
+
+
+@pytest.fixture(scope="session")
 def synthetic_probs() -> torch.Tensor:
-    """Fake (1, 4, 120, 120, 80) probability tensor with a synthetic tumour blob."""
-    rng = np.random.default_rng(0)
+    """Legacy 4-class (1, 4, H, W, D) probability tensor (bundle-path coverage)."""
     probs = np.zeros((1, 4, 120, 120, 80), dtype=np.float32)
-
-    # Background dominates
-    probs[0, 0] = 0.9
-
-    # Inject a tumour blob in class 1 (necrotic core) in right-frontal region
-    cx, cy, cz = 78, 78, 32
-    for x in range(cx - 10, cx + 10):
-        for y in range(cy - 10, cy + 10):
-            for z in range(cz - 8, cz + 8):
-                if 0 <= x < 120 and 0 <= y < 120 and 0 <= z < 80:
-                    probs[0, 0, x, y, z] = 0.05
-                    probs[0, 1, x, y, z] = 0.80
-                    probs[0, 2, x, y, z] = 0.10
-                    probs[0, 3, x, y, z] = 0.05
-
+    probs[0, 0] = 0.9  # background
+    cx, cy, cz = 78, 20, 32
+    probs[0, 0, cx - 10:cx + 10, cy - 8:cy + 8, cz - 8:cz + 8] = 0.05
+    probs[0, 1, cx - 10:cx + 10, cy - 8:cy + 8, cz - 8:cz + 8] = 0.80
+    probs[0, 2, cx - 10:cx + 10, cy - 8:cy + 8, cz - 8:cz + 8] = 0.10
+    probs[0, 3, cx - 10:cx + 10, cy - 8:cy + 8, cz - 8:cz + 8] = 0.05
     return torch.from_numpy(probs)
 
 

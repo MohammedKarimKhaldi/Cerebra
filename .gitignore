@@ -43,8 +43,10 @@ data/
 *.nii.gz
 *.dcm
 
-# Models — large weights downloaded at runtime
-models/
+# Models — ignore everything large, but DO ship our trained checkpoint + history
+models/*
+!models/cerebra_whole_tumour.pt
+!models/cerebra_whole_tumour.history.json
 
 # Outputs
 /tmp/cerebra_*/
@@ -62,3 +64,6 @@ Thumbs.db
 
 # Logs
 *.log
+
+# uv lockfile — env-specific (CPU vs CUDA torch); install uses pyproject, not the lock
+uv.lock

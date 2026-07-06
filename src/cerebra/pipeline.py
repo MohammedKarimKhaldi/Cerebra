@@ -1,7 +1,7 @@
 """Orchestrates the full triage pipeline: preprocess → infer → postprocess → report.
 
 Designed to be called from both the CLI and the FastAPI handler.
-Pass the already-loaded model in to avoid repeated bundle loading across requests.
+Pass an already-loaded model in to avoid reloading weights on every request.
 """
 
 from __future__ import annotations
@@ -11,9 +11,8 @@ import uuid
 from pathlib import Path
 
 import structlog
-import torch
 
-from cerebra.inference import get_device, load_model, run_inference
+from cerebra.inference import LoadedModel, get_device, load_model, run_inference
 from cerebra.postprocess import postprocess
 from cerebra.preprocess import load_study, preprocess
 from cerebra.schemas import ModelMetadata, TriageReport
@@ -24,19 +23,19 @@ log = structlog.get_logger()
 
 def run_triage(
     input_path: Path,
-    model: torch.nn.Module | None = None,
-    model_version: str = "unknown",
+    model: LoadedModel | None = None,
     output_dir: Path | None = None,
     study_id: str | None = None,
+    allow_fallback: bool = True,
 ) -> TriageReport:
     """End-to-end triage pipeline.
 
     Args:
-        input_path: Directory containing BraTS NIfTI files or DICOM series.
-        model: Pre-loaded PyTorch model.  Loaded from bundle on first call if None.
-        model_version: Version string for the loaded model weights.
-        output_dir: Where to write the PNG overlay.  Defaults to /tmp.
+        input_path: Directory containing BraTS/MSD NIfTI files or DICOM series.
+        model: Pre-loaded LoadedModel. Resolved from disk on first call if None.
+        output_dir: Where to write the PNG overlay. Defaults to /tmp.
         study_id: Stable identifier for this study; auto-generated if None.
+        allow_fallback: Permit the untrained smoke-test model if nothing else loads.
 
     Returns:
         TriageReport with structured findings and path to the overlay PNG.
@@ -46,11 +45,12 @@ def run_triage(
     device = get_device()
     bound_log = log.bind(study_id=study_id)
 
-    # --- Stage 1: load model (only if not passed in) ---
+    # --- Stage 1: resolve model (only if not passed in) ---
     if model is None:
         t0 = time.monotonic()
-        model, model_version = load_model(device=device)
-        bound_log.info("pipeline.load_model", latency_ms=int((time.monotonic() - t0) * 1000))
+        model = load_model(device=device, allow_fallback=allow_fallback)
+        bound_log.info("pipeline.load_model", kind=model.kind, version=model.version,
+                       latency_ms=int((time.monotonic() - t0) * 1000))
 
     # --- Stage 2: preprocess ---
     t0 = time.monotonic()
@@ -61,24 +61,19 @@ def run_triage(
     bound_log.info("pipeline.preprocess", stage="done", latency_ms=preprocess_ms,
                    shape=list(input_tensor.shape))
 
-    # --- Stage 3: inference ---
-    t0 = time.monotonic()
-    bound_log.info("pipeline.inference", stage="start")
-    probs, inference_ms = run_inference(model, input_tensor, device=device)
+    # --- Stage 3: inference (returns calibrated (H, W, D) P(tumour)) ---
+    bound_log.info("pipeline.inference", stage="start", kind=model.kind)
+    prob_map, inference_ms = run_inference(model, input_tensor, device=device)
     bound_log.info("pipeline.inference", stage="done", latency_ms=inference_ms)
 
     # --- Stage 4: postprocess ---
     t0 = time.monotonic()
-    volume_shape = tuple(input_tensor.shape[2:])    # (H, W, D)
-    findings, decision, confidence, component_mask = postprocess(probs, volume_shape)
+    volume_shape = tuple(prob_map.shape)    # (H, W, D)
+    findings, decision, confidence, component_mask = postprocess(prob_map, volume_shape)
     postprocess_ms = int((time.monotonic() - t0) * 1000)
-    bound_log.info(
-        "pipeline.postprocess",
-        stage="done",
-        latency_ms=postprocess_ms,
-        decision=decision,
-        volume_mm3=findings.tumour_volume_mm3,
-    )
+    bound_log.info("pipeline.postprocess", stage="done", latency_ms=postprocess_ms,
+                   decision=decision, volume_mm3=findings.tumour_volume_mm3,
+                   probability=confidence)
 
     # --- Stage 5: visualise ---
     t0 = time.monotonic()
@@ -93,8 +88,8 @@ def run_triage(
         confidence=confidence,
         findings=findings,
         model_metadata=ModelMetadata(
-            model_id="brats_mri_segmentation",
-            model_version=model_version,
+            model_id=f"cerebra_whole_tumour[{model.kind}]",
+            model_version=model.version,
             inference_time_ms=inference_ms,
             device=str(device),
         ),
@@ -102,11 +97,8 @@ def run_triage(
         schema_version="0.1.0",
     )
 
-    bound_log.info(
-        "pipeline.complete",
-        decision=report.triage_decision,
-        confidence=report.confidence,
-        volume_mm3=findings.tumour_volume_mm3,
-        total_ms=preprocess_ms + inference_ms + postprocess_ms + viz_ms,
-    )
+    bound_log.info("pipeline.complete", decision=report.triage_decision,
+                   confidence=report.confidence, volume_mm3=findings.tumour_volume_mm3,
+                   model_kind=model.kind,
+                   total_ms=preprocess_ms + inference_ms + postprocess_ms + viz_ms)
     return report

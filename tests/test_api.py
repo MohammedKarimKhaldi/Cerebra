@@ -22,6 +22,16 @@ def study_zip(synthetic_study_dir: Path) -> bytes:
 
 
 @pytest.fixture(scope="session")
+def study_files(synthetic_study_dir: Path) -> dict[str, bytes]:
+    """Map each modality to the raw bytes of its synthetic NIfTI file."""
+    out: dict[str, bytes] = {}
+    for mod in ("t1", "t1ce", "t2", "flair"):
+        path = synthetic_study_dir / f"BraTS_synthetic_{mod}.nii.gz"
+        out[mod] = path.read_bytes()
+    return out
+
+
+@pytest.fixture(scope="session")
 def client():
     """Synchronous TestClient for the FastAPI app."""
     from fastapi.testclient import TestClient
@@ -36,6 +46,49 @@ def test_health_endpoint(client):
     assert response.status_code == 200
     data = response.json()
     assert data["status"] == "ok"
+
+
+def test_index_serves_ui(client):
+    response = client.get("/")
+    assert response.status_code == 200
+    assert "text/html" in response.headers["content-type"]
+    assert "Cerebra" in response.text
+    assert "Run triage" in response.text
+
+
+def test_triage_files_endpoint(client, study_files):
+    """The 4-channel loose-upload endpoint returns a valid report + servable overlay."""
+    response = client.post(
+        "/triage/files",
+        files={
+            "t1": ("t1.nii.gz", study_files["t1"], "application/octet-stream"),
+            "t1ce": ("t1ce.nii.gz", study_files["t1ce"], "application/octet-stream"),
+            "t2": ("t2.nii.gz", study_files["t2"], "application/octet-stream"),
+            "flair": ("flair.nii.gz", study_files["flair"], "application/octet-stream"),
+        },
+    )
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert data["triage_decision"] in ("FLAG", "CLEAR")
+    assert 0.0 <= data["confidence"] <= 1.0
+
+    # overlay must be retrievable by the returned study_id
+    overlay = client.get(f"/overlay/{data['study_id']}")
+    assert overlay.status_code == 200
+    assert overlay.headers["content-type"] == "image/png"
+
+
+def test_triage_files_missing_channel_returns_422(client, study_files):
+    response = client.post(
+        "/triage/files",
+        files={"t1": ("t1.nii.gz", study_files["t1"], "application/octet-stream")},
+    )
+    assert response.status_code == 422
+
+
+def test_overlay_missing_returns_404(client):
+    response = client.get("/overlay/deadbeef")
+    assert response.status_code == 404
 
 
 def test_triage_returns_json(client, study_zip):
@@ -74,7 +127,7 @@ def test_triage_model_metadata(client, study_zip):
     )
     assert response.status_code == 200
     meta = response.json()["model_metadata"]
-    assert meta["model_id"] == "brats_mri_segmentation"
+    assert "cerebra_whole_tumour" in meta["model_id"]
     assert meta["inference_time_ms"] >= 0
 
 
